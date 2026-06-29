@@ -302,61 +302,82 @@ with tab1:
         st.subheader("📤 Upload & Ingest PDF")
 
         # PDF Upload (key incremented after each successful ingest to prevent infinite rerun loop)
-        uploaded_file = st.file_uploader(
-            "Upload a research paper (PDF)",
+        uploaded_files = st.file_uploader(
+            "Upload research papers (PDF, multiple allowed)",
             type=["pdf"],
+            accept_multiple_files=True,
             key=f"pdf_upload_{st.session_state.uploader_key}",
-            help="Upload TCAD/semiconductor device papers to build your knowledge base.",
+            help="Upload TCAD/semiconductor device papers to build your knowledge base. Select multiple files at once.",
         )
 
-        if uploaded_file is not None:
-            # Save uploaded file
+        if uploaded_files:
             os.makedirs(SAMPLE_PAPER_DIR, exist_ok=True)
-            save_path = os.path.join(SAMPLE_PAPER_DIR, uploaded_file.name)
-            with open(save_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+            total = len(uploaded_files)
+            overall_progress = st.progress(0, text="Starting batch ingest...")
+            status_text = st.empty()
+            success_count = 0
+            error_count = 0
+            last_store = None
 
-            # Ingest (with progress bar)
-            try:
-                progress_bar = st.progress(0, text="Starting...")
-                status_text = st.empty()
+            for i, uploaded_file in enumerate(uploaded_files):
+                save_path = os.path.join(SAMPLE_PAPER_DIR, uploaded_file.name)
+                with open(save_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
 
-                def on_progress(msg: str, pct: int):
-                    status_text.caption(msg)
-                    progress_bar.progress(pct / 100, text=msg)
+                try:
+                    overall_progress.progress(
+                        (i) / total,
+                        text=f"[{i + 1}/{total}] Ingesting {uploaded_file.name}...",
+                    )
 
-                store = ingest_pdf(
-                    file_path=save_path,
-                    store_dir=st.session_state.vectorstore_dir,
-                    progress_callback=on_progress,
-                )
-                progress_bar.empty()
-                status_text.empty()
+                    store = ingest_pdf(
+                        file_path=save_path,
+                        store_dir=st.session_state.vectorstore_dir,
+                    )
+                    last_store = store
 
-                # Update state
-                if uploaded_file.name not in st.session_state.ingested_files:
-                    st.session_state.ingested_files.append(uploaded_file.name)
-                st.session_state.rag_ready = True
+                    # Update state
+                    if uploaded_file.name not in st.session_state.ingested_files:
+                        st.session_state.ingested_files.append(uploaded_file.name)
+                    st.session_state.rag_ready = True
+
+                    # Record trace
+                    st.session_state.agent_trace.append(
+                        {
+                            "agent": "Ingest Pipeline",
+                            "action": f"Ingested {uploaded_file.name}",
+                            "result": f"{store.index.ntotal} vectors created",
+                        }
+                    )
+
+                    success_count += 1
+                    status_text.success(f"✅ [{i + 1}/{total}] {uploaded_file.name} ingested")
+
+                except Exception as e:
+                    error_count += 1
+                    status_text.error(f"❌ [{i + 1}/{total}] {uploaded_file.name} failed: {e}")
+                    logger.error(
+                        f"Batch ingest failed for {uploaded_file.name}: {e}", exc_info=True
+                    )
+
+            overall_progress.empty()
+
+            if last_store:
                 paper_agent.load_vectorstore(st.session_state.vectorstore_dir)
 
-                # Record trace
-                st.session_state.agent_trace.append(
-                    {
-                        "agent": "Ingest Pipeline",
-                        "action": f"Ingested {uploaded_file.name}",
-                        "result": f"{store.index.ntotal} vectors created",
-                    }
+            if error_count == 0:
+                overall_progress.progress(1.0, text="")
+                overall_progress.empty()
+                st.success(
+                    f"✅ All {total} papers ingested successfully! "
+                    f"Vector store: {last_store.index.ntotal if last_store else '?'} vectors"
                 )
+            else:
+                st.warning(f"⚠️ {success_count}/{total} ingested, {error_count} failed.")
 
-                st.success(f"✅ {uploaded_file.name} ingested successfully!")
-                st.caption(f"Vector store now contains {store.index.ntotal} vectors")
-
-                # Increment key to reset the file_uploader widget → prevents infinite rerun loop
-                st.session_state.uploader_key += 1
-                st.rerun()
-            except Exception as e:
-                st.error(f"❌ Ingestion failed: {str(e)}")
-                logger.error(f"Ingest failed: {e}", exc_info=True)
+            # Increment key to reset the file_uploader widget → prevents infinite rerun loop
+            st.session_state.uploader_key += 1
+            st.rerun()
 
         st.divider()
 
