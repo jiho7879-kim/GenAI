@@ -216,7 +216,12 @@ with st.sidebar:
         for fname, info in paper_files.items():
             pages = info.get("pages", "?")
             chunks = info.get("chunks", "?")
-            st.caption(f"📄 {fname}  · {pages}p · {chunks} chunks")
+            title = info.get("title", "")
+            if title and title != fname:
+                st.caption(f"📄 {title}")
+                st.caption(f"   _({fname})_  · {pages}p · {chunks} chunks")
+            else:
+                st.caption(f"📄 {fname}  · {pages}p · {chunks} chunks")
     elif st.session_state.ingested_files:
         # Fallback: show from session state (before metadata was introduced)
         for fname in st.session_state.ingested_files:
