@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from langchain_community.document_loaders import PyMuPDFLoader
+import pymupdf4llm
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -87,7 +87,8 @@ def get_embedding_model():
 #       "ingested_at": 1234567890.0,   # Unix timestamp
 #       "chunks": 42,                  # Number of chunks for this file
 #       "pages": 10,                   # Number of pages
-#       "path": "data/papers/filename.pdf"
+#       "path": "data/papers/filename.pdf",
+#       "title": "Actual Paper Title"  # Auto-detected paper title
 #     },
 #     ...
 #   }
@@ -105,12 +106,16 @@ def save_ingest_metadata(
     chunk_count: int = 0,
     page_count: int = 0,
     file_path: str = "",
+    title: str = "",
 ):
     """
     Record that a PDF has been ingested into the vector store.
 
     Creates/updates a JSON metadata file alongside the FAISS index so the
     UI can display which papers are available without re-uploading.
+
+    The ``title`` field stores the auto-detected paper title (from PDF
+    metadata or first-page heading) for display instead of the raw filename.
     """
     metadata = {}
     meta_path = _metadata_path(store_dir)
@@ -129,13 +134,19 @@ def save_ingest_metadata(
         "chunks": chunk_count,
         "pages": page_count,
         "path": file_path,
+        "title": title or filename,
     }
 
     os.makedirs(store_dir, exist_ok=True)
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
 
-    logger.info(f"Updated ingest metadata: {filename} ({chunk_count} chunks)")
+    logger.info(
+        "Updated ingest metadata: %s (%d chunks, title=%s)",
+        filename,
+        chunk_count,
+        title or filename,
+    )
 
 
 def load_ingest_metadata(store_dir: str) -> dict:
@@ -188,29 +199,125 @@ def remove_ingest_metadata(store_dir: str, filename: str) -> bool:
 # ---------- PDF Loading ----------
 
 
+def _extract_paper_title(file_path: str) -> str:
+    """
+    Extract the paper title from a PDF.
+
+    Tries (in order):
+    1. PDF metadata ``title`` field (from pymupdf4llm page metadata)
+    2. First markdown heading on page 0 (e.g. ``## Paper Title``)
+    3. Fallback to filename without extension
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        Detected paper title string.
+    """
+    filename_stem = Path(file_path).stem
+
+    try:
+        page_chunks = pymupdf4llm.to_markdown(
+            file_path,
+            page_chunks=True,
+            header=False,
+            footer=False,
+        )
+    except Exception:
+        logger.warning("Failed to extract title from %s, using filename", file_path)
+        return filename_stem
+
+    # Try 1: PDF metadata title
+    raw_title = page_chunks[0]["metadata"].get("title", "") or ""
+    if raw_title.strip():
+        return raw_title.strip()
+
+    # Try 2: First markdown heading on page 0
+    text = page_chunks[0].get("text", "")
+    heading_match = re.search(r"^#{1,3}\s+\*{0,2}(.+?)\*{0,2}\s*$", text, re.MULTILINE)
+    if heading_match:
+        title = heading_match.group(1).strip()
+        # Clean bold markers (**text**) left from partial cleanup
+        title = re.sub(r"\*\*(.+?)\*\*", r"\1", title)
+        if title:
+            return title
+
+    # Fallback: filename
+    return filename_stem
+
+
 def load_pdf(file_path: str) -> list[Document]:
     """
     Load a PDF file and return a list of Document objects (one per page).
+
+    Uses pymupdf4llm for layout-aware extraction: multi-column reading order,
+    table detection, header/footer filtering, and optional OCR.
+
+    Also extracts the paper title from PDF metadata or first-page heading
+    and stores it in each Document's ``paper_title`` metadata field.
 
     Args:
         file_path: Absolute or relative path to the PDF file.
 
     Returns:
-        List of Document objects with page_content and metadata (source, page).
+        List of Document objects with page_content (markdown) and metadata
+        (source, page, source_filename, paper_title, table_count, has_tables).
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"PDF not found: {file_path}")
 
     logger.info(f"Loading PDF: {file_path}")
-    loader = PyMuPDFLoader(file_path)
-    documents = loader.load()
-
-    # Add filename to metadata
     filename = Path(file_path).name
-    for doc in documents:
-        doc.metadata["source_filename"] = filename
 
-    logger.info(f"Loaded {len(documents)} pages from {filename}")
+    # Extract markdown pages with layout awareness
+    # header=False / footer=False strips running headers/footers
+    # page_chunks=True returns per-page dicts with metadata
+    page_chunks = pymupdf4llm.to_markdown(
+        file_path,
+        page_chunks=True,
+        header=False,
+        footer=False,
+    )
+
+    # Extract paper title from metadata or first page heading
+    raw_title = page_chunks[0]["metadata"].get("title", "") or ""
+    paper_title = raw_title.strip()
+    if not paper_title:
+        text0 = page_chunks[0].get("text", "")
+        heading_match = re.search(r"^#{1,3}\s+\*{0,2}(.+?)\*{0,2}\s*$", text0, re.MULTILINE)
+        if heading_match:
+            paper_title = heading_match.group(1).strip()
+            paper_title = re.sub(r"\*\*(.+?)\*\*", r"\1", paper_title)
+    if not paper_title:
+        paper_title = Path(file_path).stem
+
+    documents: list[Document] = []
+    for chunk in page_chunks:
+        page_num = chunk["metadata"].get("page", 0)
+        text = chunk.get("text", "")
+        tables = chunk.get("tables", [])
+        table_count = len(tables)
+
+        doc = Document(
+            page_content=text,
+            metadata={
+                "source": file_path,
+                "page": page_num,
+                "source_filename": filename,
+                "paper_title": paper_title,
+                "table_count": table_count,
+                "has_tables": table_count > 0,
+            },
+        )
+        documents.append(doc)
+
+    logger.info(
+        "Loaded %d pages from %s (title=%s, tables found: %d)",
+        len(documents),
+        filename,
+        paper_title,
+        sum(d.metadata.get("table_count", 0) for d in documents),
+    )
     return documents
 
 
@@ -485,14 +592,16 @@ def ingest_pdf(
     else:
         vectorstore = build_vectorstore(chunks, store_dir, progress_callback)
 
-    # 5. Record ingest metadata (filename, chunk count, page count)
+    # 5. Record ingest metadata with auto-detected paper title
     filename = Path(file_path).name
+    paper_title = documents[0].metadata.get("paper_title", "") if documents else filename
     save_ingest_metadata(
         store_dir=store_dir,
         filename=filename,
         chunk_count=len(chunks),
         page_count=page_count,
         file_path=file_path,
+        title=paper_title,
     )
 
     if progress_callback:
@@ -540,3 +649,62 @@ def get_store_info(store_dir: str = DEFAULT_STORE_DIR) -> dict:
         "vector_count": vs.index.ntotal if vs else 0,
         "embedding_model": EMBEDDING_MODEL,
     }
+
+
+def reset_vectorstore(
+    store_dir: str = DEFAULT_STORE_DIR,
+    *,
+    confirm: bool = False,
+) -> bool:
+    """
+    Delete the vector store index and all ingest metadata.
+
+    ⚠️  DANGEROUS — this permanently removes all embedded vectors and
+    ingest records. The original PDF files are NOT deleted.
+
+    Args:
+        store_dir: Directory containing the FAISS index.
+        confirm: Must be ``True`` to proceed. Acts as a safety guard
+            against accidental calls.
+
+    Returns:
+        True if the store was cleared, False if nothing existed.
+
+    Raises:
+        ValueError: If ``confirm`` is not ``True``.
+    """
+    if not confirm:
+        raise ValueError(
+            "reset_vectorstore() is DANGEROUS: it permanently deletes all "
+            "vector embeddings and ingest metadata. "
+            "Pass confirm=True if you are absolutely sure."
+        )
+
+    index_faiss = os.path.join(store_dir, "index.faiss")
+    index_pkl = os.path.join(store_dir, "index.pkl")
+    meta_path = _metadata_path(store_dir)
+
+    deleted_any = False
+
+    if os.path.exists(index_faiss):
+        os.remove(index_faiss)
+        logger.warning("DELETED vector index: %s", index_faiss)
+        deleted_any = True
+    if os.path.exists(index_pkl):
+        os.remove(index_pkl)
+        logger.warning("DELETED vector index: %s", index_pkl)
+        deleted_any = True
+    if os.path.exists(meta_path):
+        os.remove(meta_path)
+        logger.warning("DELETED ingest metadata: %s", meta_path)
+        deleted_any = True
+
+    if deleted_any:
+        logger.warning(
+            "Vector store at %s has been RESET. All embeddings and metadata lost.",
+            store_dir,
+        )
+    else:
+        logger.info("No vector store found at %s — nothing to reset.", store_dir)
+
+    return deleted_any
