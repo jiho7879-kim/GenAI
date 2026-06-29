@@ -56,7 +56,7 @@ A **Multi-Agent RAG system** built from scratch as the Final Project for the Fas
 | Vector Store | FAISS (CPU) | 1.14.3 |
 | Embedding Model | BAAI/bge-m3 (multilingual) | via sentence-transformers 5.6.0 |
 | LLM | Ollama (qwen3.5:4b / qwen3.5:9b) | — |
-| PDF Parser | PyMuPDF (fitz) | 1.27.2 |
+| PDF Parser | PyMuPDF4LLM (layout-aware) | 1.27.2.3 |
 | External API | Arxiv | 4.0.0 |
 
 ---
@@ -147,6 +147,30 @@ streamlit run app.py
 
 > **Note**: First run will download BGE-m3 model (~2.2 GB) from HuggingFace on first embedding. Subsequent runs use cached model.
 
+### OCR for Scanned PDFs (Optional)
+
+PyMuPDF4LLM automatically detects scanned / image-only PDF pages and runs OCR via **Tesseract** when needed. To enable this:
+
+```bash
+# Windows (requires admin or scoop)
+scoop install tesseract tesseract-languages
+
+# macOS
+brew install tesseract tesseract-lang
+
+# Linux
+sudo apt install tesseract-ocr tesseract-ocr-eng
+```
+
+OCR is triggered automatically for pages with illegible text. To force OCR on every page:
+
+```python
+import pymupdf4llm
+md = pymupdf4llm.to_markdown("scanned.pdf", force_ocr=True)
+```
+
+> **Note**: OCR is **not needed** for most born-digital academic PDFs. It is 1000× slower than native extraction and only activates when the text layer is corrupt or missing (images only).
+
 ---
 
 ## Usage
@@ -221,12 +245,16 @@ Classifies user intent using Ollama (temperature=0.0, 64 tokens max):
 ### Ingest Pipeline (`src/ingest.py`)
 
 ```
-PDF → PyMuPDFLoader → RecursiveCharacterTextSplitter → BGE-m3 → FAISS
+PDF → pymupdf4llm (layout-aware markdown) → Section-aware Splitter → BGE-m3 → FAISS
 ```
 
-- Chunk size: 512 characters, overlap: 50 characters
+- **Layout-aware extraction**: Multi-column reading order, table detection, header/footer stripping
+- **Table metadata**: Each chunk includes `table_count` and `has_tables` metadata
+- **Section-aware chunking**: Academic section headers (Introduction, Methodology, Results, etc.) detected as natural chunk boundaries
+- Chunk size: 768 characters, overlap: 50 characters
 - Embedding: BAAI/bge-m3 (multilingual, CPU-optimized)
 - Merge: New documents are merged into existing index
+- **OCR**: Automatic fallback for scanned/image PDFs (requires Tesseract)
 
 ---
 
