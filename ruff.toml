@@ -1,0 +1,17 @@
+target-version = "py313"
+line-length = 100
+
+[lint]
+select = ["F", "E", "W", "I", "N", "UP", "B", "SIM"]
+ignore = [
+    "E501",   # line too long (handled by line-length above)
+    "SIM108", # use ternary (sometimes if-else is clearer)
+    "SIM117", # multiple with statements (sometimes clearer as separate)
+]
+
+[lint.per-file-ignores]
+"app.py" = ["E402"]  # sys.path.insert before local imports (Streamlit pattern)
+
+[format]
+quote-style = "double"
+indent-style = "space"

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime data
+vectorstore/
+data/papers/
+*.faiss
+*.pkl
+
+# Cache
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+
+# Environment
+.env
+.venv
+
+# Logs
+logs/
+streamlit_err.txt
+streamlit_out.txt
+
+# Runtime session data
+.omo/run-continuation/
+
+# OS
+Thumbs.db
+.DS_Store
