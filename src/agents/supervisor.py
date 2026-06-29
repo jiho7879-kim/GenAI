@@ -6,7 +6,9 @@ Intent categories:
 - "search": Search for new papers on Arxiv
 - "report": Generate a comprehensive report combining multiple sources
 
-Classification is keyword-based (instant, no LLM needed).
+Classification uses Ollama LLM for natural language understanding (handles
+Korean, English, and mixed queries without keyword maintenance), with
+keyword-based fallback if the LLM is unavailable.
 """
 
 import logging
@@ -15,7 +17,10 @@ from typing import Literal
 from urllib import request as url_request
 from urllib.error import URLError
 
+from langchain_ollama import OllamaLLM
+
 from src.agents.query_optimizer import OptimizedQuery, optimize_query
+from src.rag_chain import MODEL_FAST
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +34,8 @@ IntentType = Literal["paper", "search", "report", "unknown"]
 _PAPER_KEYWORDS = [
     # Korean
     "요약",
+    "summary",
+    "작성",
     "설명",
     "분석",
     "해석",
@@ -43,6 +50,7 @@ _PAPER_KEYWORDS = [
     "어떻게",
     # English
     "summarize",
+    "summary",
     "what does",
     "what is",
     "explain",
@@ -183,6 +191,42 @@ def _keyword_classify(text: str) -> IntentType:
 
 
 # ---------------------------------------------------------------------------
+# LLM classification prompt (used before keyword fallback)
+# ---------------------------------------------------------------------------
+
+_CLASSIFY_PROMPT = """You are a classifier for a research paper assistant. Categorize the user's request into exactly one of:
+
+paper: User is asking about papers they have already uploaded/ingested — Q&A, summarization, explanation, analysis of their paper library.
+search: User wants to find NEW papers on Arxiv or the web — looking for papers/articles they haven't ingested yet.
+report: User wants a comprehensive written report, literature review, or synthesis combining multiple sources.
+unknown: Greeting, small talk, off-topic, or doesn't clearly fit any category.
+
+Reply with ONLY one word: paper, search, report, or unknown.
+
+Examples:
+User: 이 논문의 주요 결과를 설명해줘
+Answer: paper
+User: Find recent papers on GAA FET simulation
+Answer: search
+User: 내 논문들에서 TCAD 캘리브레이션 방법론을 비교 분석해줘
+Answer: paper
+User: Write a literature review on ML methods in TCAD
+Answer: report
+User: Search for new papers about semiconductor device modeling
+Answer: search
+User: hello
+Answer: unknown
+User: 각 paper별 summary를 한글로 작성해줘
+Answer: paper
+User: GAA 구조에 대해 설명해줘
+Answer: paper
+
+Now classify. Reply with ONLY one word.
+User: {query}
+Answer:"""
+
+
+# ---------------------------------------------------------------------------
 # Supervisor agent
 # ---------------------------------------------------------------------------
 
@@ -211,17 +255,45 @@ class SupervisorAgent:
             )
 
     def __init__(self, model_name: str = None):
-        self.model_name = model_name  # kept for compatibility, not used for classification
+        self.model_name = model_name or MODEL_FAST
         self._llm = None
+
+    def _get_llm(self):
+        """Lazy-init OllamaLLM for intent classification."""
+        if self._llm is None:
+            try:
+                self._llm = OllamaLLM(
+                    model=self.model_name,
+                    temperature=0,
+                    num_predict=16,
+                )
+            except Exception as e:
+                logger.warning("Failed to init OllamaLLM for classification: %s", e)
+        return self._llm
+
+    def _llm_classify(self, text: str) -> IntentType | None:
+        """Classify intent via LLM. Returns None if unavailable or fails."""
+        llm = self._get_llm()
+        if llm is None:
+            return None
+        try:
+            raw = llm.invoke(_CLASSIFY_PROMPT.format(query=text)).strip().lower()
+            if raw in ("paper", "search", "report", "unknown"):
+                return raw
+            logger.warning("LLM returned unrecognized intent: '%s'", raw)
+            return None
+        except Exception as e:
+            logger.warning("LLM classification failed: %s", e)
+            return None
 
     @property
     def llm(self):
-        """LLM is not used for classification but kept for potential future use."""
-        return None
+        """Kept for compatibility — returns the underlying OllamaLLM instance."""
+        return self._get_llm()
 
     def classify(self, user_input: str) -> IntentType:
         """
-        Classify the user's request into an intent category using keywords.
+        Classify the user's request using LLM, falling back to keywords.
 
         Args:
             user_input: The user's raw text input.
@@ -232,8 +304,13 @@ class SupervisorAgent:
         if not user_input or not user_input.strip():
             return "unknown"
 
+        intent = self._llm_classify(user_input)
+        if intent is not None:
+            logger.info(f"Intent: '{intent}' (LLM) from: '{user_input[:80]}...'")
+            return intent
+
         intent = _keyword_classify(user_input)
-        logger.info(f"Classified intent: '{intent}' from input: '{user_input[:80]}...'")
+        logger.info(f"Intent: '{intent}' (keyword fallback) from: '{user_input[:80]}...'")
         return intent
 
     def route(self, user_input: str) -> tuple:
