@@ -52,7 +52,13 @@ sys.path.insert(0, PROJECT_ROOT)
 import urllib.request
 
 from src.agents.supervisor import SupervisorAgent
-from src.ingest import get_ingested_files, get_store_info, ingest_pdf, load_ingest_metadata
+from src.ingest import (
+    get_ingested_files,
+    get_store_info,
+    ingest_pdf,
+    load_ingest_metadata,
+    reset_vectorstore,
+)
 from src.rag_chain import MODEL_ACCURATE, MODEL_FAST
 
 # Check Ollama availability at startup
@@ -254,6 +260,32 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.agent_trace = []
         st.rerun()
+
+    st.divider()
+
+    reset_key = "_confirm_reset"
+    if st.session_state.get(reset_key):
+        st.warning("⚠️ 모든 임베딩과 메타데이터가 영구 삭제됩니다. PDF 파일은 유지됩니다.")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("✅ Confirm Reset", type="primary", use_container_width=True):
+                try:
+                    reset_vectorstore(st.session_state.vectorstore_dir, confirm=True)
+                    st.session_state.rag_ready = False
+                    st.session_state.ingested_files = []
+                    st.session_state[reset_key] = False
+                    st.success("Reset complete!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Reset failed: {e}")
+        with col_b:
+            if st.button("❌ Cancel", use_container_width=True):
+                st.session_state[reset_key] = False
+                st.rerun()
+    else:
+        if st.button("🗑️ Reset Vector Store", type="secondary", use_container_width=True):
+            st.session_state[reset_key] = True
+            st.rerun()
 
 # ---------- Main Tabs ----------
 
